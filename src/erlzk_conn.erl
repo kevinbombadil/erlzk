@@ -21,7 +21,7 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 -export([create/5, delete/3, exists/3, exists/4, get_data/3, get_data/4, set_data/4, get_acl/2, set_acl/4,
          get_children/3, get_children/4, sync/2, get_children2/3, get_children2/4,
-         multi/2, create2/5, add_auth/3]).
+         multi/2, create2/5, add_auth/, no_heartbeat/1]).
 
 -define(ZK_SOCKET_OPTS, [binary, {active, true}, {packet, 4}, {reuseaddr, true}]).
 -ifdef(zk_connect_timeout).
@@ -56,6 +56,7 @@
     zxid = 0,
     reset_watch = true,
     monitor = undefined,
+    heartbeat_watcher,
     reqs = dict:new(),
     auths = queue:new(),
     watchers = {dict:new(), dict:new(), dict:new()}
@@ -130,6 +131,9 @@ create2(Pid, Path, Data, Acl, CreateMode) ->
 add_auth(Pid, Scheme, Auth) ->
     gen_server:call(Pid, {add_auth, {Scheme, Auth}}).
 
+no_heartbeat(Pid) ->
+    gen_server:call(Pid, {no_heartbeat}).
+
 %% ===================================================================
 %% gen_server Callbacks
 %% ===================================================================
@@ -150,7 +154,8 @@ init([ServerList, Timeout, Options]) ->
     process_flag(trap_exit, true),
     case connect(shuffle(ServerList), 0, 0, Timeout, 0, <<0:128>>) of
         {ok, State=#state{ping_interval=PingIntv}} ->
-            NewState = State#state{servers=ServerList, auth_data=AuthData, chroot=Chroot, reset_watch=ResetWatch, monitor=Monitor},
+            HeartbeatWatcher = erlzk_heartbeat:start(self(),PingIntv),
+            NewState = State#state{servers=ServerList, auth_data=AuthData, chroot=Chroot, reset_watch=ResetWatch, monitor=Monitor, heartbeat_watcher=HeartbeatWatcher},
             add_init_auths(AuthData, NewState),
             {ok, NewState, PingIntv};
         {error, Reason} ->
@@ -193,6 +198,11 @@ handle_call({Op, Args, Watcher}, From, State=#state{chroot=Chroot, socket=Socket
         {error, Reason} ->
             {reply, {error, Reason}, State#state{xid=Xid+1}, PingIntv}
     end;
+handle_call({no_heartbeat}, State=#state{host=Host, port=Port, monitor=Monitor, socket=Socket}) ->
+    gen_tcp:close(Socket),
+    error_logger:error_msg("Connection to ~p:~p is not responding, reconnect now~n", [Host, Port]),
+    notify_monitor_server_state(Monitor, disconnected, Host, Port),
+    reconnect(State#state{host=undefined, port=undefined});
 handle_call(_Request, _From, State=#state{ping_interval=PingIntv}) ->
     {noreply, State, PingIntv}.
 
@@ -202,8 +212,10 @@ handle_cast(_Request, State=#state{ping_interval=PingIntv}) ->
 handle_info(timeout, State=#state{socket=Socket, ping_interval=PingIntv}) ->
     gen_tcp:send(Socket, <<-2:32, 11:32>>),
     {noreply, State, PingIntv};
-handle_info({tcp, _Port, Packet}, State=#state{chroot=Chroot, ping_interval=PingIntv, auths=Auths, reqs=Reqs, watchers=Watchers}) ->
+handle_info({tcp, _Port, Packet}, State=#state{chroot=Chroot, ping_interval=PingIntv, auths=Auths, reqs=Reqs, 
+         watchers=Watchers, heartbeat_watcher=HeartbeatWatcher}) ->
     {Xid, Zxid, Code, Body} = erlzk_codec:unpack(Packet),
+    erlzk_heartbeat:beat(HeartBeatWatcher),    
     case Xid of
         -1 -> % watched event
             {EventType, _KeeperState, Path} = erlzk_codec:unpack(watched_event, Body, Chroot),
@@ -347,7 +359,8 @@ reconnect(State=#state{servers=ServerList, auth_data=AuthData, chroot=Chroot,
     case connect(shuffle(ServerList), ProtoVer, Zxid, Timeout, SessionId, Passwd) of
         {ok, NewState=#state{host=Host, port=Port, ping_interval=PingIntv}} ->
             error_logger:warning_msg("Reconnect to ~p:~p successful~n", [Host, Port]),
-            RenewState = NewState#state{servers=ServerList, auth_data=AuthData, chroot=Chroot,
+	    {ok,HeartbeatWatcher} = erlzk_heartbeat:start_link(self(), PingIntv),
+            RenewState = NewState#state{servers=ServerList, auth_data=AuthData, chroot=Chroot, heartbeat_watcher=HeartbeatWatcher,
                                         xid=Xid, zxid=Zxid, reset_watch=ResetWatch, monitor=Monitor, watchers=Watchers},
             notify_monitor_server_state(Monitor, connected, Host, Port),
             {noreply, RenewState, PingIntv};
